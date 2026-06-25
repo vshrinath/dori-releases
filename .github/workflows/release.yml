@@ -1,0 +1,115 @@
+name: Build & Publish Release
+
+# This repo is PUBLIC and exists only to host downloadable artifacts + the Tauri
+# updater manifest (latest.json). The actual code lives in the private
+# dori-engine / dori-portal repos, which are checked out here at the release tag.
+#
+# Triggered by:
+#  - repository_dispatch (event_type: release) fired from dori-engine on a v* tag
+#  - workflow_dispatch (manual) with a tag input — use this for the first test run
+#
+# A tag containing a hyphen (e.g. v1.7.0-beta.1) is published as a PRERELEASE,
+# which is what the portal /api/update beta channel serves.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag to build (must already exist on dori-engine + dori-portal), e.g. v1.7.0'
+        required: true
+  repository_dispatch:
+    types: [release]
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        # Add `windows-latest` here to ship Windows — see notes at the bottom.
+        platform: [macos-latest]
+
+    runs-on: ${{ matrix.platform }}
+    permissions:
+      contents: write # create the release in THIS repo
+
+    env:
+      TAG: ${{ github.event.inputs.tag || github.event.client_payload.tag }}
+
+    steps:
+      # Paths MUST be dori-engine/ and dori-portal/ (siblings): the portal's
+      # build:tauri copies into ../dori-engine/desktop/...
+      - name: Checkout engine (at tag)
+        uses: actions/checkout@v4
+        with:
+          repository: vshrinath/dori-engine
+          ref: ${{ env.TAG }}
+          token: ${{ secrets.BUILD_TOKEN }}
+          path: dori-engine
+
+      - name: Checkout portal (at tag)
+        uses: actions/checkout@v4
+        with:
+          repository: vshrinath/dori-portal
+          ref: ${{ env.TAG }}
+          token: ${{ secrets.BUILD_TOKEN }}
+          path: dori-portal
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: 'pnpm'
+          cache-dependency-path: dori-portal/pnpm-lock.yaml
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: dori-engine/desktop/src-tauri -> target
+
+      - name: Build Next.js portal
+        working-directory: dori-portal
+        run: |
+          pnpm install
+          pnpm run build:tauri
+        env:
+          NEXT_TELEMETRY_DISABLED: 1
+
+      # tauri-action creates/updates the release in THIS (public) repo and
+      # generates latest.json with public asset URLs. Across a matrix it
+      # aggregates each platform into the one release/manifest.
+      - name: Build & publish Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+        with:
+          projectPath: dori-engine/desktop/src-tauri
+          tagName: ${{ env.TAG }}
+          releaseName: 'Dori ${{ env.TAG }}'
+          releaseBody: 'See the assets below to download and install.'
+          releaseDraft: false
+          # Hyphenated tags (v1.7.0-beta.1) → prerelease → served on the beta channel.
+          prerelease: ${{ contains(env.TAG, '-') }}
+          args: --target universal-apple-darwin
+
+# ── Adding Windows later ──────────────────────────────────────────────────────
+# 1. Add `windows-latest` to the matrix above.
+# 2. Guard the macOS-only `args`/targets so each runner builds its own target,
+#    e.g. set args per-platform (universal-apple-darwin on macOS, default on
+#    Windows). tauri-action merges both platforms into the same latest.json.
+# 3. Add Windows signing secrets if you want to avoid SmartScreen warnings
+#    (Authenticode). The Tauri updater signature (TAURI_PRIVATE_KEY) is the same
+#    key cross-platform — no change needed there.
+# The portal /api/update route already returns platforms['windows-x86_64'], so
+# no server change is needed for Windows.
