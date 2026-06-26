@@ -12,9 +12,12 @@ name: Build & Publish Release
 # which is what the portal /api/update beta channel serves.
 #
 # Build flow:
-#   checkout engine + portal (at tag) + processing-services (latest main)
-#   → pnpm install (workspace) + npm install (processing)
-#   → portal build:tauri → build-sidecars.mjs → cargo tauri build (tauri-action)
+#   checkout → get SHAs → restore component caches → build only what's missing
+#   → cargo tauri build → sign → publish DMG + latest.json + components.json
+#
+# Cache keys are git SHAs so unchanged components are never rebuilt, even across
+# different release tags. Users skip downloads for unchanged components via sha256
+# comparison in the in-app component updater.
 
 on:
   workflow_dispatch:
@@ -30,19 +33,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Add `windows-latest` here to ship Windows — see notes at the bottom.
         platform: [macos-latest]
 
     runs-on: ${{ matrix.platform }}
     permissions:
-      contents: write # create the release in THIS repo
+      contents: write
 
     env:
       TAG: ${{ github.event.inputs.tag || github.event.client_payload.tag }}
 
     steps:
-      # Paths MUST be dori-engine/ dori-portal/ dori-processing-services/ (siblings):
-      # the portal's build:tauri copies into ../dori-engine/desktop/...
+      # Paths MUST be siblings: portal's build:tauri copies into ../dori-engine/desktop/...
       # and build-sidecars.mjs looks for processing at ../dori-processing-services.
       - name: Checkout engine (at tag)
         uses: actions/checkout@v4
@@ -60,8 +61,6 @@ jobs:
           token: ${{ secrets.BUILD_TOKEN }}
           path: dori-portal
 
-      # processing-services is not versioned in sync with engine/portal tags yet —
-      # check out latest main. Update this to use ${{ env.TAG }} once it's tagged.
       - name: Checkout processing-services (latest main)
         uses: actions/checkout@v4
         with:
@@ -79,60 +78,83 @@ jobs:
         with:
           node-version: 22.x
 
-      # build-sidecars.mjs runs `pnpm deploy --filter dori` from the workspace root.
-      # In CI that root is the runner workspace, so we need a minimal workspace config.
+      # Get git SHAs used as cache keys — one per component.
+      - name: Get component cache keys
+        id: sha
+        run: |
+          echo "engine=$(git -C dori-engine rev-parse HEAD)" >> $GITHUB_OUTPUT
+          echo "portal=$(git -C dori-portal rev-parse HEAD)" >> $GITHUB_OUTPUT
+          echo "proc=$(git -C dori-processing-services rev-parse HEAD 2>/dev/null || echo none)" >> $GITHUB_OUTPUT
+          echo "node=$(node --version)" >> $GITHUB_OUTPUT
+
+      # ── Component caches (keyed on git SHA) ───────────────────────────────────
+      # Cache hit = component unchanged = skip build, restore directory directly.
+      - name: Cache engine sidecar
+        id: engine-cache
+        uses: actions/cache@v4
+        with:
+          path: dori-engine/desktop/src-tauri/engine-build
+          key: engine-build-${{ steps.sha.outputs.engine }}-${{ steps.sha.outputs.node }}
+
+      - name: Cache portal build
+        id: portal-cache
+        uses: actions/cache@v4
+        with:
+          path: dori-engine/desktop/src-tauri/portal-build
+          key: portal-build-${{ steps.sha.outputs.portal }}
+
+      - name: Cache processing sidecar
+        id: proc-cache
+        uses: actions/cache@v4
+        with:
+          path: dori-engine/desktop/src-tauri/processing-build
+          key: processing-build-${{ steps.sha.outputs.proc }}-${{ steps.sha.outputs.node }}
+
+      - name: Cache node runtime
+        id: node-cache
+        uses: actions/cache@v4
+        with:
+          path: dori-engine/desktop/src-tauri/node-runtime
+          key: node-runtime-${{ steps.sha.outputs.node }}
+
+      # ── Dependencies (only what's needed for uncached components) ─────────────
       - name: Create workspace config
         run: |
           printf 'packages:\n  - dori-engine\n  - dori-engine/packages/*\n  - dori-portal\n  - dori-processing-services\n' > pnpm-workspace.yaml
 
-      - name: Install workspace dependencies (engine + portal)
+      - name: Install workspace dependencies
+        if: steps.engine-cache.outputs.cache-hit != 'true' || steps.portal-cache.outputs.cache-hit != 'true'
         run: pnpm install
 
-      # processing-services uses npm, not pnpm. Install dev deps for the tsc build.
       - name: Install processing-services dependencies
+        if: steps.proc-cache.outputs.cache-hit != 'true'
         working-directory: dori-processing-services
         run: npm ci
 
-      # Determine which components changed vs the previous release.
-      # Fetches the previous components.json, compares git SHAs, and sets outputs
-      # used to skip building unchanged components.
-      - name: Determine changed components
-        id: changed
+      # ── Build uncached components ─────────────────────────────────────────────
+      # Workspace packages (@dori/*) must be compiled before the portal build.
+      - name: Build workspace packages (@dori/*)
+        if: steps.portal-cache.outputs.cache-hit != 'true'
+        run: pnpm --filter "@dori/*" -r build
+
+      - name: Build portal (build:tauri)
+        if: steps.portal-cache.outputs.cache-hit != 'true'
+        working-directory: dori-portal
+        run: pnpm run build:tauri
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          NODE_VER=$(node --version)
+          NEXT_TELEMETRY_DISABLED: 1
 
-          # Fetch previous components.json (empty object if no prior release)
-          PREV=$(gh api repos/${{ github.repository }}/releases/latest \
-            --jq '.assets[] | select(.name=="components.json") | .browser_download_url' 2>/dev/null \
-            | xargs curl -sf 2>/dev/null || echo '{}')
+      # build-sidecars.mjs reads SKIP_* to skip cached components.
+      - name: Build sidecars
+        working-directory: dori-engine/desktop
+        env:
+          SKIP_ENGINE:     ${{ steps.engine-cache.outputs.cache-hit }}
+          SKIP_PROCESSING: ${{ steps.proc-cache.outputs.cache-hit }}
+          SKIP_NODE:       ${{ steps.node-cache.outputs.cache-hit }}
+          DORI_APP_VERSION: ${{ env.TAG }}
+        run: node scripts/build-sidecars.mjs
 
-          prev_sha() { echo "$PREV" | jq -r --arg k "$1" '.[$k].gitSha // ""'; }
-          prev_node() { echo "$PREV" | jq -r '."node-runtime".version // ""'; }
-
-          PORTAL_SHA=$(git -C dori-portal rev-parse HEAD)
-          ENGINE_SHA=$(git -C dori-engine rev-parse HEAD)
-          PROC_SHA=$(git -C dori-processing-services rev-parse HEAD 2>/dev/null || echo "")
-
-          portal_changed=true; engine_changed=true; proc_changed=true; node_changed=true
-          [ "$(prev_sha portal-server)"      = "$PORTAL_SHA" ] && portal_changed=false
-          [ "$(prev_sha engine-server)"      = "$ENGINE_SHA"  ] && engine_changed=false
-          [ "$(prev_sha processing-server)"  = "$PROC_SHA"    ] && proc_changed=false
-          [ "$(prev_node)"                   = "$NODE_VER"    ] && node_changed=false
-
-          echo "portal=$portal_changed"    >> $GITHUB_OUTPUT
-          echo "engine=$engine_changed"    >> $GITHUB_OUTPUT
-          echo "processing=$proc_changed"  >> $GITHUB_OUTPUT
-          echo "node=$node_changed"        >> $GITHUB_OUTPUT
-          echo "portal_sha=$PORTAL_SHA"    >> $GITHUB_OUTPUT
-          echo "engine_sha=$ENGINE_SHA"    >> $GITHUB_OUTPUT
-          echo "proc_sha=$PROC_SHA"        >> $GITHUB_OUTPUT
-          echo "node_ver=$NODE_VER"        >> $GITHUB_OUTPUT
-          echo "prev_components=$PREV"     >> $GITHUB_OUTPUT
-
-          echo "portal=$portal_changed engine=$engine_changed processing=$proc_changed node=$node_changed"
-
+      # ── Rust build ────────────────────────────────────────────────────────────
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -143,31 +165,7 @@ jobs:
         with:
           workspaces: dori-engine/desktop/src-tauri -> target
 
-      # Workspace packages (@dori/*) are installed but not compiled after a fresh
-      # checkout. The portal's webpack needs their dist/ to resolve imports.
-      - name: Build workspace packages (@dori/*)
-        run: pnpm --filter "@dori/*" -r build
-
-      - name: Build Next.js portal (build:tauri)
-        if: steps.changed.outputs.portal == 'true'
-        working-directory: dori-portal
-        run: pnpm run build:tauri
-        env:
-          NEXT_TELEMETRY_DISABLED: 1
-
-      # Bundles engine + processing sidecars and downloads the shared Node runtime.
-      # Passes SKIP_* env vars so build-sidecars.mjs skips unchanged components.
-      - name: Build sidecars
-        working-directory: dori-engine/desktop
-        env:
-          SKIP_ENGINE: ${{ steps.changed.outputs.engine == 'false' }}
-          SKIP_PROCESSING: ${{ steps.changed.outputs.processing == 'false' }}
-          SKIP_NODE: ${{ steps.changed.outputs.node == 'false' }}
-          DORI_APP_VERSION: ${{ env.TAG }}
-        run: node scripts/build-sidecars.mjs
-
-      # Extract user-facing release notes for this version from RELEASE_NOTES.md.
-      # These go into the GitHub Release body and latest.json (in-app update dialog).
+      # ── Release notes ─────────────────────────────────────────────────────────
       - name: Extract release notes
         id: notes
         run: |
@@ -180,13 +178,11 @@ jobs:
           echo "$NOTES" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-      # tauri-action creates/updates the release in THIS (public) repo.
-      # No beforeBuildCommand needed — sidecars are already in place from the step above.
+      # ── Tauri build + publish DMG ─────────────────────────────────────────────
       - name: Build & publish Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Tauri v2 signing env var names (v1 used TAURI_PRIVATE_KEY / TAURI_KEY_PASSWORD)
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
         with:
@@ -195,14 +191,11 @@ jobs:
           releaseName: 'Dori ${{ env.TAG }}'
           releaseBody: ${{ steps.notes.outputs.notes }}
           releaseDraft: false
-          # Hyphenated tags (v1.7.0-beta.1) → prerelease → served on the beta channel.
           prerelease: ${{ contains(env.TAG, '-') }}
           updaterJsonKeepUniversal: true
           args: --target universal-apple-darwin
 
-      # tauri-action doesn't generate the .sig file for universal macOS builds, so we
-      # sign the update bundle ourselves with cargo tauri signer sign, then build and
-      # upload latest.json manually.
+      # ── Sign + upload latest.json ─────────────────────────────────────────────
       - name: Sign update bundle and upload latest.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -224,7 +217,6 @@ jobs:
           PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
           URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/Dori_universal.app.tar.gz"
           NOTES="${{ steps.notes.outputs.notes }}"
-          # jq properly escapes newlines and special chars in string values.
           jq -n \
             --arg version "$VERSION" \
             --arg notes "$NOTES" \
@@ -235,50 +227,31 @@ jobs:
             > latest.json
           gh release upload "${TAG}" latest.json --clobber -R "${{ github.repository }}"
 
-      # Publish component archives. For each component:
-      # - If the git SHA matches the previous release → reuse the previous archive URL (no rebuild, no re-upload)
-      # - If changed → tar, sha256, upload the new archive
-      # components.json records version + sha256 + url + gitSha for each component.
+      # ── Publish component archives + components.json ──────────────────────────
+      # Always tar + upload all four components (upload is fast ~30s per component).
+      # components.json sha256 entries let the in-app updater skip unchanged downloads.
       - name: Publish component archives and components.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PREV_COMPONENTS: ${{ steps.changed.outputs.prev_components }}
-          PORTAL_CHANGED:     ${{ steps.changed.outputs.portal }}
-          ENGINE_CHANGED:     ${{ steps.changed.outputs.engine }}
-          PROCESSING_CHANGED: ${{ steps.changed.outputs.processing }}
-          NODE_CHANGED:       ${{ steps.changed.outputs.node }}
-          PORTAL_SHA:     ${{ steps.changed.outputs.portal_sha }}
-          ENGINE_SHA:     ${{ steps.changed.outputs.engine_sha }}
-          PROC_SHA:       ${{ steps.changed.outputs.proc_sha }}
-          NODE_VER:       ${{ steps.changed.outputs.node_ver }}
+          ENGINE_SHA:  ${{ steps.sha.outputs.engine }}
+          PORTAL_SHA:  ${{ steps.sha.outputs.portal }}
+          PROC_SHA:    ${{ steps.sha.outputs.proc }}
+          NODE_VER:    ${{ steps.sha.outputs.node }}
         run: |
           VERSION="${TAG#v}"
           REPO="${{ github.repository }}"
           BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
-
-          # Build components.json entries using jq to accumulate safely.
           ENTRIES='{}'
 
           publish_component() {
-            local COMPONENT="$1" SRC="$2" CHANGED="$3" GIT_SHA="$4"
+            local COMPONENT="$1" SRC="$2" GIT_SHA="$3"
             local ARCHIVE="${COMPONENT}-${VERSION}.tar.gz"
 
-            if [ "$CHANGED" = "false" ]; then
-              # Reuse previous archive URL — component unchanged
-              PREV_ENTRY=$(echo "$PREV_COMPONENTS" | jq -r --arg k "$COMPONENT" '.[$k] // empty')
-              if [ -n "$PREV_ENTRY" ]; then
-                echo "✓ $COMPONENT unchanged — reusing previous archive"
-                ENTRIES=$(echo "$ENTRIES" | jq --arg k "$COMPONENT" --argjson v "$PREV_ENTRY" '.[$k] = $v')
-                return
-              fi
-            fi
-
             if [ ! -d "$SRC" ]; then
-              echo "⚠ $COMPONENT: source dir $SRC missing, skipping"
+              echo "⚠ $COMPONENT: $SRC missing, skipping"
               return
             fi
 
-            echo "↑ $COMPONENT changed — building and uploading archive"
             tar czf "$ARCHIVE" -C "$(dirname "$SRC")" "$(basename "$SRC")"
             SHA=$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')
             gh release upload "${TAG}" "$ARCHIVE" --clobber -R "$REPO"
@@ -292,24 +265,21 @@ jobs:
               --arg k "$COMPONENT" --arg ver "$COMP_VERSION" \
               --arg sha "$SHA" --arg url "$BASE_URL/$ARCHIVE" --arg git "$GIT_SHA" \
               '.[$k] = {version:$ver, sha256:$sha, url:$url, gitSha:$git}')
+            echo "↑ $COMPONENT uploaded ($ARCHIVE, sha256=$SHA)"
           }
 
-          publish_component "engine-server"     "dori-engine/desktop/src-tauri/engine-build"     "$ENGINE_CHANGED"     "$ENGINE_SHA"
-          publish_component "portal-server"     "dori-engine/desktop/src-tauri/portal-build"     "$PORTAL_CHANGED"     "$PORTAL_SHA"
-          publish_component "processing-server" "dori-engine/desktop/src-tauri/processing-build" "$PROCESSING_CHANGED" "$PROC_SHA"
-          publish_component "node-runtime"      "dori-engine/desktop/src-tauri/node-runtime"     "$NODE_CHANGED"       "$NODE_VER"
+          publish_component "engine-server"     "dori-engine/desktop/src-tauri/engine-build"     "$ENGINE_SHA"
+          publish_component "portal-server"     "dori-engine/desktop/src-tauri/portal-build"     "$PORTAL_SHA"
+          publish_component "processing-server" "dori-engine/desktop/src-tauri/processing-build" "$PROC_SHA"
+          publish_component "node-runtime"      "dori-engine/desktop/src-tauri/node-runtime"     "$NODE_VER"
 
           echo "$ENTRIES" | jq '.' > components.json
           gh release upload "${TAG}" components.json --clobber -R "$REPO"
-          echo "Published components.json"
+          echo "Published components.json:"
           cat components.json
 
 # ── Adding Windows later ──────────────────────────────────────────────────────
-# 1. Add `windows-latest` to the matrix above.
-# 2. Guard the macOS-only `args`/targets so each runner builds its own target.
-#    tauri-action merges both platforms into the same latest.json.
-# 3. In build-sidecars.mjs: guard the darwin-arm64 Node URL by platform and skip
-#    the darwin-arm64 ONNX prune on Windows.
-# 4. Add Windows signing secrets if you want to avoid SmartScreen warnings.
-#    The TAURI_PRIVATE_KEY updater signature is cross-platform — no change needed.
+# 1. Add `windows-latest` to the matrix.
+# 2. Guard darwin-arm64 Node URL and ONNX prune by platform in build-sidecars.mjs.
+# 3. Add Windows signing secrets if needed (TAURI_PRIVATE_KEY is cross-platform).
 # The portal /api/update route already returns platforms['windows-x86_64'].
