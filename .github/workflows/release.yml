@@ -78,8 +78,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22.x
-          cache: 'pnpm'
-          cache-dependency-path: dori-portal/pnpm-lock.yaml
 
       # build-sidecars.mjs runs `pnpm deploy --filter dori` from the workspace root.
       # In CI that root is the runner workspace, so we need a minimal workspace config.
