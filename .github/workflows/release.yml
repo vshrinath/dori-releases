@@ -10,6 +10,11 @@ name: Build & Publish Release
 #
 # A tag containing a hyphen (e.g. v1.7.0-beta.1) is published as a PRERELEASE,
 # which is what the portal /api/update beta channel serves.
+#
+# Build flow:
+#   checkout engine + portal (at tag) + processing-services (latest main)
+#   → pnpm install (workspace) + npm install (processing)
+#   → portal build:tauri → build-sidecars.mjs → cargo tauri build (tauri-action)
 
 on:
   workflow_dispatch:
@@ -36,8 +41,9 @@ jobs:
       TAG: ${{ github.event.inputs.tag || github.event.client_payload.tag }}
 
     steps:
-      # Paths MUST be dori-engine/ and dori-portal/ (siblings): the portal's
-      # build:tauri copies into ../dori-engine/desktop/...
+      # Paths MUST be dori-engine/ dori-portal/ dori-processing-services/ (siblings):
+      # the portal's build:tauri copies into ../dori-engine/desktop/...
+      # and build-sidecars.mjs looks for processing at ../dori-processing-services.
       - name: Checkout engine (at tag)
         uses: actions/checkout@v4
         with:
@@ -54,6 +60,15 @@ jobs:
           token: ${{ secrets.BUILD_TOKEN }}
           path: dori-portal
 
+      # processing-services is not versioned in sync with engine/portal tags yet —
+      # check out latest main. Update this to use ${{ env.TAG }} once it's tagged.
+      - name: Checkout processing-services (latest main)
+        uses: actions/checkout@v4
+        with:
+          repository: vshrinath/dori-processing-services
+          token: ${{ secrets.BUILD_TOKEN }}
+          path: dori-processing-services
+
       - name: Install pnpm
         uses: pnpm/action-setup@v3
         with:
@@ -66,6 +81,20 @@ jobs:
           cache: 'pnpm'
           cache-dependency-path: dori-portal/pnpm-lock.yaml
 
+      # build-sidecars.mjs runs `pnpm deploy --filter dori` from the workspace root.
+      # In CI that root is the runner workspace, so we need a minimal workspace config.
+      - name: Create workspace config
+        run: |
+          printf 'packages:\n  - dori-engine\n  - dori-portal\n  - dori-processing-services\n' > pnpm-workspace.yaml
+
+      - name: Install workspace dependencies (engine + portal)
+        run: pnpm install
+
+      # processing-services uses npm, not pnpm. Install dev deps for the tsc build.
+      - name: Install processing-services dependencies
+        working-directory: dori-processing-services
+        run: npm ci
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -76,17 +105,21 @@ jobs:
         with:
           workspaces: dori-engine/desktop/src-tauri -> target
 
-      - name: Build Next.js portal
+      - name: Build Next.js portal (build:tauri)
         working-directory: dori-portal
-        run: |
-          pnpm install
-          pnpm run build:tauri
+        run: pnpm run build:tauri
         env:
           NEXT_TELEMETRY_DISABLED: 1
 
-      # tauri-action creates/updates the release in THIS (public) repo and
-      # generates latest.json with public asset URLs. Across a matrix it
-      # aggregates each platform into the one release/manifest.
+      # Bundles engine + processing sidecars and downloads the shared Node runtime.
+      # In CI there are no cache markers, so this always runs in full (cold build).
+      - name: Build sidecars
+        working-directory: dori-engine/desktop
+        run: node scripts/build-sidecars.mjs
+
+      # tauri-action creates/updates the release in THIS (public) repo and generates
+      # latest.json with public asset URLs. No beforeBuildCommand needed — sidecars
+      # are already in place from the step above.
       - name: Build & publish Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
@@ -105,11 +138,10 @@ jobs:
 
 # ── Adding Windows later ──────────────────────────────────────────────────────
 # 1. Add `windows-latest` to the matrix above.
-# 2. Guard the macOS-only `args`/targets so each runner builds its own target,
-#    e.g. set args per-platform (universal-apple-darwin on macOS, default on
-#    Windows). tauri-action merges both platforms into the same latest.json.
-# 3. Add Windows signing secrets if you want to avoid SmartScreen warnings
-#    (Authenticode). The Tauri updater signature (TAURI_PRIVATE_KEY) is the same
-#    key cross-platform — no change needed there.
-# The portal /api/update route already returns platforms['windows-x86_64'], so
-# no server change is needed for Windows.
+# 2. Guard the macOS-only `args`/targets so each runner builds its own target.
+#    tauri-action merges both platforms into the same latest.json.
+# 3. In build-sidecars.mjs: guard the darwin-arm64 Node URL by platform and skip
+#    the darwin-arm64 ONNX prune on Windows.
+# 4. Add Windows signing secrets if you want to avoid SmartScreen warnings.
+#    The TAURI_PRIVATE_KEY updater signature is cross-platform — no change needed.
+# The portal /api/update route already returns platforms['windows-x86_64'].
