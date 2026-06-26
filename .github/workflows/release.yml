@@ -241,7 +241,7 @@ jobs:
           projectPath: dori-engine/desktop/src-tauri
           tagName: ${{ env.TAG }}
           releaseName: 'Dori ${{ env.TAG }}'
-          releaseBody: ${{ steps.notes.outputs.notes }}
+          releaseBody: 'See assets below to download and install.'
           releaseDraft: false
           prerelease: ${{ contains(env.TAG, '-') }}
           updaterJsonKeepUniversal: true
