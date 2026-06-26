@@ -103,6 +103,11 @@ jobs:
         with:
           workspaces: dori-engine/desktop/src-tauri -> target
 
+      # Workspace packages (@dori/*) are installed but not compiled after a fresh
+      # checkout. The portal's webpack needs their dist/ to resolve imports.
+      - name: Build workspace packages (@dori/*)
+        run: pnpm --filter "@dori/*" -r build
+
       - name: Build Next.js portal (build:tauri)
         working-directory: dori-portal
         run: pnpm run build:tauri
