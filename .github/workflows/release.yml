@@ -83,7 +83,7 @@ jobs:
       # In CI that root is the runner workspace, so we need a minimal workspace config.
       - name: Create workspace config
         run: |
-          printf 'packages:\n  - dori-engine\n  - dori-portal\n  - dori-processing-services\n' > pnpm-workspace.yaml
+          printf 'packages:\n  - dori-engine\n  - dori-engine/packages/*\n  - dori-portal\n  - dori-processing-services\n' > pnpm-workspace.yaml
 
       - name: Install workspace dependencies (engine + portal)
         run: pnpm install
