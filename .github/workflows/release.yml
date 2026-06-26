@@ -182,6 +182,52 @@ jobs:
             "$VERSION" "$NOTES" "$PUB_DATE" "$SIG" "$URL" > latest.json
           gh release upload "${TAG}" latest.json --clobber -R "${{ github.repository }}"
 
+      # Publish individual component archives so the in-app component updater can
+      # download only what changed rather than re-downloading the full DMG.
+      # Each archive is a tar.gz of just that component's directory.
+      # components.json is the manifest the engine polls to check for stale components.
+      - name: Publish component archives and components.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${TAG#v}"
+          REPO="${{ github.repository }}"
+          BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
+          COMPONENTS_JSON="{"
+
+          for COMPONENT in engine-server portal-server processing-server node-runtime; do
+            case "$COMPONENT" in
+              engine-server)    SRC="dori-engine/desktop/src-tauri/engine-build" ;;
+              portal-server)    SRC="dori-engine/desktop/src-tauri/portal-build" ;;
+              processing-server) SRC="dori-engine/desktop/src-tauri/processing-build" ;;
+              node-runtime)     SRC="dori-engine/desktop/src-tauri/node-runtime" ;;
+            esac
+
+            if [ ! -d "$SRC" ]; then
+              echo "Skipping $COMPONENT — $SRC not found"
+              continue
+            fi
+
+            ARCHIVE="${COMPONENT}-${VERSION}.tar.gz"
+            tar czf "$ARCHIVE" -C "$(dirname $SRC)" "$(basename $SRC)"
+            SHA=$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')
+            gh release upload "${TAG}" "$ARCHIVE" --clobber -R "$REPO"
+
+            # Read installed version from component-version.json if present
+            COMP_VERSION="$VERSION"
+            if [ -f "$SRC/component-version.json" ]; then
+              COMP_VERSION=$(python3 -c "import json,sys; d=json.load(open('$SRC/component-version.json')); print(d.get('version','$VERSION'))" 2>/dev/null || echo "$VERSION")
+            fi
+
+            COMPONENTS_JSON="${COMPONENTS_JSON}\"${COMPONENT}\":{\"version\":\"${COMP_VERSION}\",\"sha256\":\"${SHA}\",\"url\":\"${BASE_URL}/${ARCHIVE}\"},"
+          done
+
+          # Strip trailing comma and close object
+          COMPONENTS_JSON="${COMPONENTS_JSON%,}}"
+          echo "$COMPONENTS_JSON" | python3 -m json.tool > components.json
+          gh release upload "${TAG}" components.json --clobber -R "$REPO"
+          echo "Published components.json"
+
 # ── Adding Windows later ──────────────────────────────────────────────────────
 # 1. Add `windows-latest` to the matrix above.
 # 2. Guard the macOS-only `args`/targets so each runner builds its own target.
