@@ -120,9 +120,22 @@ jobs:
         working-directory: dori-engine/desktop
         run: node scripts/build-sidecars.mjs
 
-      # tauri-action creates/updates the release in THIS (public) repo and generates
-      # latest.json with public asset URLs. No beforeBuildCommand needed — sidecars
-      # are already in place from the step above.
+      # Extract user-facing release notes for this version from RELEASE_NOTES.md.
+      # These go into the GitHub Release body and latest.json (in-app update dialog).
+      - name: Extract release notes
+        id: notes
+        run: |
+          NOTES=$(awk "/^## ${TAG}/{found=1; next} found && /^## v/{exit} found{print}" \
+            dori-engine/docs/RELEASE_NOTES.md | sed '/^[[:space:]]*$/d' | head -20)
+          if [ -z "$NOTES" ]; then
+            NOTES="See https://github.com/vshrinath/dori-releases/releases/tag/${TAG} for details."
+          fi
+          echo "notes<<EOF" >> $GITHUB_OUTPUT
+          echo "$NOTES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      # tauri-action creates/updates the release in THIS (public) repo.
+      # No beforeBuildCommand needed — sidecars are already in place from the step above.
       - name: Build & publish Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
@@ -134,7 +147,7 @@ jobs:
           projectPath: dori-engine/desktop/src-tauri
           tagName: ${{ env.TAG }}
           releaseName: 'Dori ${{ env.TAG }}'
-          releaseBody: 'See the assets below to download and install.'
+          releaseBody: ${{ steps.notes.outputs.notes }}
           releaseDraft: false
           # Hyphenated tags (v1.7.0-beta.1) → prerelease → served on the beta channel.
           prerelease: ${{ contains(env.TAG, '-') }}
@@ -163,8 +176,9 @@ jobs:
           VERSION="${TAG#v}"
           PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
           URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/Dori_universal.app.tar.gz"
-          printf '{\n  "version": "%s",\n  "notes": "Dori %s",\n  "pub_date": "%s",\n  "platforms": {\n    "darwin-universal": {\n      "signature": "%s",\n      "url": "%s"\n    }\n  }\n}\n' \
-            "$VERSION" "$TAG" "$PUB_DATE" "$SIG" "$URL" > latest.json
+          NOTES="${{ steps.notes.outputs.notes }}"
+          printf '{\n  "version": "%s",\n  "notes": "%s",\n  "pub_date": "%s",\n  "platforms": {\n    "darwin-universal": {\n      "signature": "%s",\n      "url": "%s"\n    }\n  }\n}\n' \
+            "$VERSION" "$NOTES" "$PUB_DATE" "$SIG" "$URL" > latest.json
           gh release upload "${TAG}" latest.json --clobber -R "${{ github.repository }}"
 
 # ── Adding Windows later ──────────────────────────────────────────────────────
