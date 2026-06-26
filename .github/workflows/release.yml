@@ -93,6 +93,46 @@ jobs:
         working-directory: dori-processing-services
         run: npm ci
 
+      # Determine which components changed vs the previous release.
+      # Fetches the previous components.json, compares git SHAs, and sets outputs
+      # used to skip building unchanged components.
+      - name: Determine changed components
+        id: changed
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          NODE_VER=$(node --version)
+
+          # Fetch previous components.json (empty object if no prior release)
+          PREV=$(gh api repos/${{ github.repository }}/releases/latest \
+            --jq '.assets[] | select(.name=="components.json") | .browser_download_url' 2>/dev/null \
+            | xargs curl -sf 2>/dev/null || echo '{}')
+
+          prev_sha() { echo "$PREV" | jq -r --arg k "$1" '.[$k].gitSha // ""'; }
+          prev_node() { echo "$PREV" | jq -r '."node-runtime".version // ""'; }
+
+          PORTAL_SHA=$(git -C dori-portal rev-parse HEAD)
+          ENGINE_SHA=$(git -C dori-engine rev-parse HEAD)
+          PROC_SHA=$(git -C dori-processing-services rev-parse HEAD 2>/dev/null || echo "")
+
+          portal_changed=true; engine_changed=true; proc_changed=true; node_changed=true
+          [ "$(prev_sha portal-server)"      = "$PORTAL_SHA" ] && portal_changed=false
+          [ "$(prev_sha engine-server)"      = "$ENGINE_SHA"  ] && engine_changed=false
+          [ "$(prev_sha processing-server)"  = "$PROC_SHA"    ] && proc_changed=false
+          [ "$(prev_node)"                   = "$NODE_VER"    ] && node_changed=false
+
+          echo "portal=$portal_changed"    >> $GITHUB_OUTPUT
+          echo "engine=$engine_changed"    >> $GITHUB_OUTPUT
+          echo "processing=$proc_changed"  >> $GITHUB_OUTPUT
+          echo "node=$node_changed"        >> $GITHUB_OUTPUT
+          echo "portal_sha=$PORTAL_SHA"    >> $GITHUB_OUTPUT
+          echo "engine_sha=$ENGINE_SHA"    >> $GITHUB_OUTPUT
+          echo "proc_sha=$PROC_SHA"        >> $GITHUB_OUTPUT
+          echo "node_ver=$NODE_VER"        >> $GITHUB_OUTPUT
+          echo "prev_components=$PREV"     >> $GITHUB_OUTPUT
+
+          echo "portal=$portal_changed engine=$engine_changed processing=$proc_changed node=$node_changed"
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -109,15 +149,21 @@ jobs:
         run: pnpm --filter "@dori/*" -r build
 
       - name: Build Next.js portal (build:tauri)
+        if: steps.changed.outputs.portal == 'true'
         working-directory: dori-portal
         run: pnpm run build:tauri
         env:
           NEXT_TELEMETRY_DISABLED: 1
 
       # Bundles engine + processing sidecars and downloads the shared Node runtime.
-      # In CI there are no cache markers, so this always runs in full (cold build).
+      # Passes SKIP_* env vars so build-sidecars.mjs skips unchanged components.
       - name: Build sidecars
         working-directory: dori-engine/desktop
+        env:
+          SKIP_ENGINE: ${{ steps.changed.outputs.engine == 'false' }}
+          SKIP_PROCESSING: ${{ steps.changed.outputs.processing == 'false' }}
+          SKIP_NODE: ${{ steps.changed.outputs.node == 'false' }}
+          DORI_APP_VERSION: ${{ env.TAG }}
         run: node scripts/build-sidecars.mjs
 
       # Extract user-facing release notes for this version from RELEASE_NOTES.md.
@@ -189,51 +235,74 @@ jobs:
             > latest.json
           gh release upload "${TAG}" latest.json --clobber -R "${{ github.repository }}"
 
-      # Publish individual component archives so the in-app component updater can
-      # download only what changed rather than re-downloading the full DMG.
-      # Each archive is a tar.gz of just that component's directory.
-      # components.json is the manifest the engine polls to check for stale components.
+      # Publish component archives. For each component:
+      # - If the git SHA matches the previous release → reuse the previous archive URL (no rebuild, no re-upload)
+      # - If changed → tar, sha256, upload the new archive
+      # components.json records version + sha256 + url + gitSha for each component.
       - name: Publish component archives and components.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PREV_COMPONENTS: ${{ steps.changed.outputs.prev_components }}
+          PORTAL_CHANGED:     ${{ steps.changed.outputs.portal }}
+          ENGINE_CHANGED:     ${{ steps.changed.outputs.engine }}
+          PROCESSING_CHANGED: ${{ steps.changed.outputs.processing }}
+          NODE_CHANGED:       ${{ steps.changed.outputs.node }}
+          PORTAL_SHA:     ${{ steps.changed.outputs.portal_sha }}
+          ENGINE_SHA:     ${{ steps.changed.outputs.engine_sha }}
+          PROC_SHA:       ${{ steps.changed.outputs.proc_sha }}
+          NODE_VER:       ${{ steps.changed.outputs.node_ver }}
         run: |
           VERSION="${TAG#v}"
           REPO="${{ github.repository }}"
           BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
-          COMPONENTS_JSON="{"
 
-          for COMPONENT in engine-server portal-server processing-server node-runtime; do
-            case "$COMPONENT" in
-              engine-server)    SRC="dori-engine/desktop/src-tauri/engine-build" ;;
-              portal-server)    SRC="dori-engine/desktop/src-tauri/portal-build" ;;
-              processing-server) SRC="dori-engine/desktop/src-tauri/processing-build" ;;
-              node-runtime)     SRC="dori-engine/desktop/src-tauri/node-runtime" ;;
-            esac
+          # Build components.json entries using jq to accumulate safely.
+          ENTRIES='{}'
 
-            if [ ! -d "$SRC" ]; then
-              echo "Skipping $COMPONENT — $SRC not found"
-              continue
+          publish_component() {
+            local COMPONENT="$1" SRC="$2" CHANGED="$3" GIT_SHA="$4"
+            local ARCHIVE="${COMPONENT}-${VERSION}.tar.gz"
+
+            if [ "$CHANGED" = "false" ]; then
+              # Reuse previous archive URL — component unchanged
+              PREV_ENTRY=$(echo "$PREV_COMPONENTS" | jq -r --arg k "$COMPONENT" '.[$k] // empty')
+              if [ -n "$PREV_ENTRY" ]; then
+                echo "✓ $COMPONENT unchanged — reusing previous archive"
+                ENTRIES=$(echo "$ENTRIES" | jq --arg k "$COMPONENT" --argjson v "$PREV_ENTRY" '.[$k] = $v')
+                return
+              fi
             fi
 
-            ARCHIVE="${COMPONENT}-${VERSION}.tar.gz"
-            tar czf "$ARCHIVE" -C "$(dirname $SRC)" "$(basename $SRC)"
+            if [ ! -d "$SRC" ]; then
+              echo "⚠ $COMPONENT: source dir $SRC missing, skipping"
+              return
+            fi
+
+            echo "↑ $COMPONENT changed — building and uploading archive"
+            tar czf "$ARCHIVE" -C "$(dirname "$SRC")" "$(basename "$SRC")"
             SHA=$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')
             gh release upload "${TAG}" "$ARCHIVE" --clobber -R "$REPO"
 
-            # Read installed version from component-version.json if present
             COMP_VERSION="$VERSION"
             if [ -f "$SRC/component-version.json" ]; then
-              COMP_VERSION=$(python3 -c "import json,sys; d=json.load(open('$SRC/component-version.json')); print(d.get('version','$VERSION'))" 2>/dev/null || echo "$VERSION")
+              COMP_VERSION=$(jq -r --arg v "$VERSION" '.version // $v' "$SRC/component-version.json")
             fi
 
-            COMPONENTS_JSON="${COMPONENTS_JSON}\"${COMPONENT}\":{\"version\":\"${COMP_VERSION}\",\"sha256\":\"${SHA}\",\"url\":\"${BASE_URL}/${ARCHIVE}\"},"
-          done
+            ENTRIES=$(echo "$ENTRIES" | jq \
+              --arg k "$COMPONENT" --arg ver "$COMP_VERSION" \
+              --arg sha "$SHA" --arg url "$BASE_URL/$ARCHIVE" --arg git "$GIT_SHA" \
+              '.[$k] = {version:$ver, sha256:$sha, url:$url, gitSha:$git}')
+          }
 
-          # Strip trailing comma and close object
-          COMPONENTS_JSON="${COMPONENTS_JSON%,}}"
-          echo "$COMPONENTS_JSON" | python3 -m json.tool > components.json
+          publish_component "engine-server"     "dori-engine/desktop/src-tauri/engine-build"     "$ENGINE_CHANGED"     "$ENGINE_SHA"
+          publish_component "portal-server"     "dori-engine/desktop/src-tauri/portal-build"     "$PORTAL_CHANGED"     "$PORTAL_SHA"
+          publish_component "processing-server" "dori-engine/desktop/src-tauri/processing-build" "$PROCESSING_CHANGED" "$PROC_SHA"
+          publish_component "node-runtime"      "dori-engine/desktop/src-tauri/node-runtime"     "$NODE_CHANGED"       "$NODE_VER"
+
+          echo "$ENTRIES" | jq '.' > components.json
           gh release upload "${TAG}" components.json --clobber -R "$REPO"
           echo "Published components.json"
+          cat components.json
 
 # ── Adding Windows later ──────────────────────────────────────────────────────
 # 1. Add `windows-latest` to the matrix above.
