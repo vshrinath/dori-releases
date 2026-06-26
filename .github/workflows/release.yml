@@ -154,6 +154,18 @@ jobs:
           DORI_APP_VERSION: ${{ env.TAG }}
         run: node scripts/build-sidecars.mjs
 
+      # ── Create release (must exist before any asset uploads) ─────────────────
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${TAG}" \
+            --repo "${{ github.repository }}" \
+            --title "Dori ${TAG}" \
+            --notes "See assets below to download and install." \
+            ${{ contains(env.TAG, '-') && '--prerelease' || '' }} \
+            2>/dev/null || true
+
       # ── Publish component archives + components.json ──────────────────────────
       # Done BEFORE the Tauri build so components are available even if cargo fails.
       # Always uploads all four (upload is fast ~30s); sha256 in components.json
