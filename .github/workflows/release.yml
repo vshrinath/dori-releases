@@ -178,8 +178,24 @@ jobs:
           PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
           URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/Dori_universal.app.tar.gz"
           NOTES="${{ steps.notes.outputs.notes }}"
-          printf '{\n  "version": "%s",\n  "notes": "%s",\n  "pub_date": "%s",\n  "platforms": {\n    "darwin-universal": {\n      "signature": "%s",\n      "url": "%s"\n    }\n  }\n}\n' \
-            "$VERSION" "$NOTES" "$PUB_DATE" "$SIG" "$URL" > latest.json
+          # Use python3 to produce valid JSON — printf embeds raw newlines which break JSON strings.
+          python3 - <<PYEOF
+import json, os
+data = {
+  "version": os.environ["VERSION"],
+  "notes": os.environ["NOTES"],
+  "pub_date": os.environ["PUB_DATE"],
+  "platforms": {
+    "darwin-universal": {
+      "signature": os.environ["SIG"],
+      "url": os.environ["URL"],
+    }
+  }
+}
+with open("latest.json", "w") as f:
+  json.dump(data, f, indent=2)
+  f.write("\n")
+PYEOF
           gh release upload "${TAG}" latest.json --clobber -R "${{ github.repository }}"
 
       # Publish individual component archives so the in-app component updater can
