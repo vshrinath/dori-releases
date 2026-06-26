@@ -168,7 +168,7 @@ jobs:
             echo "ERROR: no .app.tar.gz found under target/" && exit 1
           fi
           echo "Signing: $TAR_GZ"
-          cargo tauri signer sign \
+          npx --yes @tauri-apps/cli signer sign \
             --private-key "$TAURI_SIGNING_PRIVATE_KEY" \
             --password "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" \
             "$TAR_GZ"
