@@ -154,6 +154,58 @@ jobs:
           DORI_APP_VERSION: ${{ env.TAG }}
         run: node scripts/build-sidecars.mjs
 
+      # ── Publish component archives + components.json ──────────────────────────
+      # Done BEFORE the Tauri build so components are available even if cargo fails.
+      # Always uploads all four (upload is fast ~30s); sha256 in components.json
+      # lets the in-app updater skip unchanged downloads on the user's machine.
+      - name: Publish component archives and components.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ENGINE_SHA:  ${{ steps.sha.outputs.engine }}
+          PORTAL_SHA:  ${{ steps.sha.outputs.portal }}
+          PROC_SHA:    ${{ steps.sha.outputs.proc }}
+          NODE_VER:    ${{ steps.sha.outputs.node }}
+        run: |
+          VERSION="${TAG#v}"
+          REPO="${{ github.repository }}"
+          BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
+          ENTRIES='{}'
+
+          publish_component() {
+            local COMPONENT="$1" SRC="$2" GIT_SHA="$3"
+            local ARCHIVE="${COMPONENT}-${VERSION}.tar.gz"
+
+            if [ ! -d "$SRC" ]; then
+              echo "⚠ $COMPONENT: $SRC missing, skipping"
+              return
+            fi
+
+            tar czf "$ARCHIVE" -C "$(dirname "$SRC")" "$(basename "$SRC")"
+            SHA=$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')
+            gh release upload "${TAG}" "$ARCHIVE" --clobber -R "$REPO"
+
+            COMP_VERSION="$VERSION"
+            if [ -f "$SRC/component-version.json" ]; then
+              COMP_VERSION=$(jq -r --arg v "$VERSION" '.version // $v' "$SRC/component-version.json")
+            fi
+
+            ENTRIES=$(echo "$ENTRIES" | jq \
+              --arg k "$COMPONENT" --arg ver "$COMP_VERSION" \
+              --arg sha "$SHA" --arg url "$BASE_URL/$ARCHIVE" --arg git "$GIT_SHA" \
+              '.[$k] = {version:$ver, sha256:$sha, url:$url, gitSha:$git}')
+            echo "↑ $COMPONENT uploaded ($ARCHIVE, sha256=$SHA)"
+          }
+
+          publish_component "engine-server"     "dori-engine/desktop/src-tauri/engine-build"     "$ENGINE_SHA"
+          publish_component "portal-server"     "dori-engine/desktop/src-tauri/portal-build"     "$PORTAL_SHA"
+          publish_component "processing-server" "dori-engine/desktop/src-tauri/processing-build" "$PROC_SHA"
+          publish_component "node-runtime"      "dori-engine/desktop/src-tauri/node-runtime"     "$NODE_VER"
+
+          echo "$ENTRIES" | jq '.' > components.json
+          gh release upload "${TAG}" components.json --clobber -R "$REPO"
+          echo "Published components.json:"
+          cat components.json
+
       # ── Rust build ────────────────────────────────────────────────────────────
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -226,57 +278,6 @@ jobs:
             '{version:$version,notes:$notes,pub_date:$pub_date,platforms:{"darwin-universal":{signature:$sig,url:$url}}}' \
             > latest.json
           gh release upload "${TAG}" latest.json --clobber -R "${{ github.repository }}"
-
-      # ── Publish component archives + components.json ──────────────────────────
-      # Always tar + upload all four components (upload is fast ~30s per component).
-      # components.json sha256 entries let the in-app updater skip unchanged downloads.
-      - name: Publish component archives and components.json
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ENGINE_SHA:  ${{ steps.sha.outputs.engine }}
-          PORTAL_SHA:  ${{ steps.sha.outputs.portal }}
-          PROC_SHA:    ${{ steps.sha.outputs.proc }}
-          NODE_VER:    ${{ steps.sha.outputs.node }}
-        run: |
-          VERSION="${TAG#v}"
-          REPO="${{ github.repository }}"
-          BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
-          ENTRIES='{}'
-
-          publish_component() {
-            local COMPONENT="$1" SRC="$2" GIT_SHA="$3"
-            local ARCHIVE="${COMPONENT}-${VERSION}.tar.gz"
-
-            if [ ! -d "$SRC" ]; then
-              echo "⚠ $COMPONENT: $SRC missing, skipping"
-              return
-            fi
-
-            tar czf "$ARCHIVE" -C "$(dirname "$SRC")" "$(basename "$SRC")"
-            SHA=$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')
-            gh release upload "${TAG}" "$ARCHIVE" --clobber -R "$REPO"
-
-            COMP_VERSION="$VERSION"
-            if [ -f "$SRC/component-version.json" ]; then
-              COMP_VERSION=$(jq -r --arg v "$VERSION" '.version // $v' "$SRC/component-version.json")
-            fi
-
-            ENTRIES=$(echo "$ENTRIES" | jq \
-              --arg k "$COMPONENT" --arg ver "$COMP_VERSION" \
-              --arg sha "$SHA" --arg url "$BASE_URL/$ARCHIVE" --arg git "$GIT_SHA" \
-              '.[$k] = {version:$ver, sha256:$sha, url:$url, gitSha:$git}')
-            echo "↑ $COMPONENT uploaded ($ARCHIVE, sha256=$SHA)"
-          }
-
-          publish_component "engine-server"     "dori-engine/desktop/src-tauri/engine-build"     "$ENGINE_SHA"
-          publish_component "portal-server"     "dori-engine/desktop/src-tauri/portal-build"     "$PORTAL_SHA"
-          publish_component "processing-server" "dori-engine/desktop/src-tauri/processing-build" "$PROC_SHA"
-          publish_component "node-runtime"      "dori-engine/desktop/src-tauri/node-runtime"     "$NODE_VER"
-
-          echo "$ENTRIES" | jq '.' > components.json
-          gh release upload "${TAG}" components.json --clobber -R "$REPO"
-          echo "Published components.json:"
-          cat components.json
 
 # ── Adding Windows later ──────────────────────────────────────────────────────
 # 1. Add `windows-latest` to the matrix.
