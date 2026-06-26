@@ -148,7 +148,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          SIG=$(cat dori-engine/desktop/src-tauri/target/universal-apple-darwin/release/bundle/macos/Dori.app.tar.gz.sig)
+          SIG_FILE=$(find dori-engine/desktop/src-tauri/target -name "*.app.tar.gz.sig" 2>/dev/null | head -1)
+          if [ -z "$SIG_FILE" ]; then
+            echo "ERROR: no .app.tar.gz.sig found under target/" && find dori-engine/desktop/src-tauri/target -name "*.sig" 2>/dev/null && exit 1
+          fi
+          echo "Found sig: $SIG_FILE"
+          SIG=$(cat "$SIG_FILE")
           VERSION="${TAG#v}"
           PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
           URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/Dori_universal.app.tar.gz"
