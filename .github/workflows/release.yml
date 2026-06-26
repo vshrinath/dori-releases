@@ -138,6 +138,7 @@ jobs:
           releaseDraft: false
           # Hyphenated tags (v1.7.0-beta.1) → prerelease → served on the beta channel.
           prerelease: ${{ contains(env.TAG, '-') }}
+          updaterJsonKeepUniversal: true
           args: --target universal-apple-darwin
 
 # ── Adding Windows later ──────────────────────────────────────────────────────
