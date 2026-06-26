@@ -141,6 +141,21 @@ jobs:
           updaterJsonKeepUniversal: true
           args: --target universal-apple-darwin
 
+      # tauri-action can't match the .sig file to the uploaded asset (naming mismatch:
+      # Dori.app.tar.gz.sig vs Dori_universal.app.tar.gz), so we generate latest.json
+      # ourselves and upload it directly.
+      - name: Generate and upload latest.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SIG=$(cat dori-engine/desktop/src-tauri/target/universal-apple-darwin/release/bundle/macos/Dori.app.tar.gz.sig)
+          VERSION="${TAG#v}"
+          PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/Dori_universal.app.tar.gz"
+          printf '{\n  "version": "%s",\n  "notes": "Dori %s",\n  "pub_date": "%s",\n  "platforms": {\n    "darwin-universal": {\n      "signature": "%s",\n      "url": "%s"\n    }\n  }\n}\n' \
+            "$VERSION" "$TAG" "$PUB_DATE" "$SIG" "$URL" > latest.json
+          gh release upload "${TAG}" latest.json --clobber -R "${{ github.repository }}"
+
 # ── Adding Windows later ──────────────────────────────────────────────────────
 # 1. Add `windows-latest` to the matrix above.
 # 2. Guard the macOS-only `args`/targets so each runner builds its own target.
