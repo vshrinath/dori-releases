@@ -141,19 +141,25 @@ jobs:
           updaterJsonKeepUniversal: true
           args: --target universal-apple-darwin
 
-      # tauri-action can't match the .sig file to the uploaded asset (naming mismatch:
-      # Dori.app.tar.gz.sig vs Dori_universal.app.tar.gz), so we generate latest.json
-      # ourselves and upload it directly.
-      - name: Generate and upload latest.json
+      # tauri-action doesn't generate the .sig file for universal macOS builds, so we
+      # sign the update bundle ourselves with cargo tauri signer sign, then build and
+      # upload latest.json manually.
+      - name: Sign update bundle and upload latest.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
         run: |
-          SIG_FILE=$(find dori-engine/desktop/src-tauri/target -name "*.app.tar.gz.sig" 2>/dev/null | head -1)
-          if [ -z "$SIG_FILE" ]; then
-            echo "ERROR: no .app.tar.gz.sig found under target/" && find dori-engine/desktop/src-tauri/target -name "*.sig" 2>/dev/null && exit 1
+          TAR_GZ=$(find dori-engine/desktop/src-tauri/target -name "*.app.tar.gz" 2>/dev/null | head -1)
+          if [ -z "$TAR_GZ" ]; then
+            echo "ERROR: no .app.tar.gz found under target/" && exit 1
           fi
-          echo "Found sig: $SIG_FILE"
-          SIG=$(cat "$SIG_FILE")
+          echo "Signing: $TAR_GZ"
+          cargo tauri signer sign \
+            --private-key "$TAURI_SIGNING_PRIVATE_KEY" \
+            --password "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" \
+            "$TAR_GZ"
+          SIG=$(cat "${TAR_GZ}.sig")
           VERSION="${TAG#v}"
           PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
           URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/Dori_universal.app.tar.gz"
