@@ -231,6 +231,16 @@ jobs:
           echo "EOF" >> $GITHUB_OUTPUT
 
       # ── Tauri build + publish DMG ─────────────────────────────────────────────
+      # Reset release body before tauri-action fetches it — multiline notes from a
+      # prior run cause "Bad control character in JSON" when tauri-action parses the
+      # GitHub API response.
+      - name: Reset release body
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit "${TAG}" --notes "See assets below to download and install." \
+            -R "${{ github.repository }}" 2>/dev/null || true
+
       - name: Build & publish Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
