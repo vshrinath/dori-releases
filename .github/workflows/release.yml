@@ -1,308 +1,254 @@
-name: Build & Publish Release
-
-# This repo is PUBLIC and exists only to host downloadable artifacts + the Tauri
-# updater manifest (latest.json). The actual code lives in the private
-# dori-engine / dori-portal repos, which are checked out here at the release tag.
-#
-# Triggered by:
-#  - repository_dispatch (event_type: release) fired from dori-engine on a v* tag
-#  - workflow_dispatch (manual) with a tag input — use this for the first test run
-#
-# A tag containing a hyphen (e.g. v1.7.0-beta.1) is published as a PRERELEASE,
-# which is what the portal /api/update beta channel serves.
-#
-# Build flow:
-#   checkout → get SHAs → restore component caches → build only what's missing
-#   → cargo tauri build → sign → publish DMG + latest.json + components.json
-#
-# Cache keys are git SHAs so unchanged components are never rebuilt, even across
-# different release tags. Users skip downloads for unchanged components via sha256
-# comparison in the in-app component updater.
+name: Build and validate atomic release
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Version tag to build (must already exist on dori-engine + dori-portal), e.g. v1.7.0'
+        description: Release tag, for example v1.14.1
         required: true
-  repository_dispatch:
-    types: [release]
+        type: string
+      root_sha:
+        description: Full immutable commit SHA from vshrinath/dori
+        required: true
+        type: string
+      dry_run:
+        description: Build and validate without creating a GitHub release
+        required: true
+        default: true
+        type: boolean
+
+concurrency:
+  group: dori-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
 
 jobs:
   release:
-    strategy:
-      fail-fast: false
-      matrix:
-        platform: [macos-latest]
-
-    runs-on: ${{ matrix.platform }}
-    permissions:
-      contents: write
-
+    runs-on: macos-15
     env:
-      TAG: ${{ github.event.inputs.tag || github.event.client_payload.tag }}
+      TAG: ${{ inputs.tag }}
+      ROOT_SHA: ${{ inputs.root_sha }}
+      DORI_CAPABILITY_MANIFEST_PATH: ${{ github.workspace }}/artifacts/capabilities.json
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
 
     steps:
-      # Paths MUST be siblings: portal's build:tauri copies into ../dori-engine/desktop/...
-      # and build-sidecars.mjs looks for processing at ../dori-processing-services.
-      - name: Checkout engine (at tag)
-        uses: actions/checkout@v4
-        with:
-          repository: vshrinath/dori-engine
-          ref: ${{ env.TAG }}
-          token: ${{ secrets.BUILD_TOKEN }}
-          path: dori-engine
+      - name: Validate immutable inputs
+        run: |
+          if ! [[ "$ROOT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::root_sha must be a full 40-character commit SHA"
+            exit 1
+          fi
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
+            echo "::error::tag must be an explicit semantic version beginning with v"
+            exit 1
+          fi
 
-      - name: Checkout portal (at tag)
-        uses: actions/checkout@v4
-        with:
-          repository: vshrinath/dori-portal
-          ref: ${{ env.TAG }}
-          token: ${{ secrets.BUILD_TOKEN }}
-          path: dori-portal
+      - name: Preflight release credentials
+        env:
+          BUILD_TOKEN: ${{ secrets.BUILD_TOKEN }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          missing=0
+          for name in BUILD_TOKEN APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID TAURI_SIGNING_PRIVATE_KEY; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error title=Missing release credential::$name is not configured"
+              missing=1
+            fi
+          done
+          exit "$missing"
 
-      - name: Checkout processing-services (latest main)
+      - name: Reject an existing release tag
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "::error::A release already exists for $TAG; refusing to replace pinned inputs or assets"
+            exit 1
+          fi
+
+      - name: Checkout pinned Dori workspace
         uses: actions/checkout@v4
         with:
-          repository: vshrinath/dori-processing-services
+          repository: vshrinath/dori
+          ref: ${{ inputs.root_sha }}
           token: ${{ secrets.BUILD_TOKEN }}
-          path: dori-processing-services
+          path: dori
+          submodules: recursive
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Record all source revisions
+        run: |
+          test "$(git -C dori rev-parse HEAD)" = "$ROOT_SHA"
+          mkdir -p artifacts
+          root=$(git -C dori rev-parse HEAD)
+          engine=$(git -C dori/dori-engine rev-parse HEAD)
+          portal=$(git -C dori/dori-portal rev-parse HEAD)
+          processing=$(git -C dori/dori-processing-services rev-parse HEAD)
+          broker=$(git -C dori/workers/dori-auth-broker rev-parse HEAD)
+          jq -n \
+            --arg tag "$TAG" --arg root "$root" --arg engine "$engine" \
+            --arg portal "$portal" --arg processing "$processing" --arg broker "$broker" \
+            '{schemaVersion:1,tag:$tag,source:{root:$root,engine:$engine,portal:$portal,processing:$processing,authBroker:$broker}}' \
+            > artifacts/provenance.json
+          cat artifacts/provenance.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: dori/pnpm-lock.yaml
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
         with:
           version: 10.25.0
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24.x
+      - name: Install frozen workspace dependencies
+        working-directory: dori
+        run: pnpm install --frozen-lockfile
 
-      # Get git SHAs used as cache keys — one per component.
-      - name: Get component cache keys
-        id: sha
-        run: |
-          echo "engine=$(git -C dori-engine rev-parse HEAD)" >> $GITHUB_OUTPUT
-          echo "portal=$(git -C dori-portal rev-parse HEAD)" >> $GITHUB_OUTPUT
-          echo "proc=$(git -C dori-processing-services rev-parse HEAD 2>/dev/null || echo none)" >> $GITHUB_OUTPUT
-          echo "node=$(node --version)" >> $GITHUB_OUTPUT
-
-      # ── Component caches (keyed on git SHA) ───────────────────────────────────
-      # Cache hit = component unchanged = skip build, restore directory directly.
-      - name: Cache engine sidecar
-        id: engine-cache
-        uses: actions/cache@v4
-        with:
-          path: dori-engine/desktop/src-tauri/engine-build
-          key: engine-build-${{ steps.sha.outputs.engine }}-${{ steps.sha.outputs.node }}
-
-      - name: Cache portal build
-        id: portal-cache
-        uses: actions/cache@v4
-        with:
-          path: dori-engine/desktop/src-tauri/portal-build
-          key: portal-build-${{ steps.sha.outputs.portal }}
-
-      - name: Cache processing sidecar
-        id: proc-cache
-        uses: actions/cache@v4
-        with:
-          path: dori-engine/desktop/src-tauri/processing-build
-          key: processing-build-${{ steps.sha.outputs.proc }}-${{ steps.sha.outputs.node }}
-
-      - name: Cache node runtime
-        id: node-cache
-        uses: actions/cache@v4
-        with:
-          path: dori-engine/desktop/src-tauri/node-runtime
-          key: node-runtime-${{ steps.sha.outputs.node }}
-
-      # ── Dependencies (only what's needed for uncached components) ─────────────
-      - name: Create workspace config
-        run: |
-          printf 'packages:\n  - dori-engine\n  - dori-engine/packages/*\n  - dori-portal\n  - dori-processing-services\n' > pnpm-workspace.yaml
-
-      - name: Install workspace dependencies
-        if: steps.engine-cache.outputs.cache-hit != 'true' || steps.portal-cache.outputs.cache-hit != 'true'
-        run: pnpm install
-
-      - name: Install processing-services dependencies
-        if: steps.proc-cache.outputs.cache-hit != 'true'
-        working-directory: dori-processing-services
+      - name: Install frozen processing dependencies
+        working-directory: dori/dori-processing-services
         run: npm ci
 
-      # ── Build uncached components ─────────────────────────────────────────────
-      # Workspace packages (@dori/*) must be compiled before the portal build.
-      - name: Build workspace packages (@dori/*)
-        if: steps.portal-cache.outputs.cache-hit != 'true'
-        run: pnpm --filter "@dori/*" -r build
-
-      - name: Build portal (build:tauri)
-        if: steps.portal-cache.outputs.cache-hit != 'true'
-        working-directory: dori-portal
-        run: pnpm run build:tauri
-        env:
-          NEXT_TELEMETRY_DISABLED: 1
-
-      # build-sidecars.mjs reads SKIP_* to skip cached components.
-      - name: Build sidecars
-        working-directory: dori-engine/desktop
-        env:
-          SKIP_ENGINE:     ${{ steps.engine-cache.outputs.cache-hit }}
-          SKIP_PROCESSING: ${{ steps.proc-cache.outputs.cache-hit }}
-          SKIP_NODE:       ${{ steps.node-cache.outputs.cache-hit }}
-          DORI_APP_VERSION: ${{ env.TAG }}
-        run: node scripts/build-sidecars.mjs
-
-      # ── Create release (must exist before any asset uploads) ─────────────────
-      - name: Create GitHub Release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify source and contracts
+        working-directory: dori
         run: |
-          gh release create "${TAG}" \
-            --repo "${{ github.repository }}" \
-            --title "Dori ${TAG}" \
-            --notes "See assets below to download and install." \
-            ${{ contains(env.TAG, '-') && '--prerelease' || '' }} \
-            2>/dev/null || true
+          node scripts/check-agent-instructions.mjs
+          node scripts/check-governance.mjs
+          pnpm --filter './dori-engine/packages/*' build
+          pnpm -C dori-engine typecheck
+          pnpm -C dori-engine test
+          pnpm -C dori-portal typecheck
+          pnpm -C dori-portal test
+          npm --prefix dori-processing-services test
+          npm --prefix dori-processing-services run build
 
-      # ── Publish component archives + components.json ──────────────────────────
-      # Done BEFORE the Tauri build so components are available even if cargo fails.
-      # Always uploads all four (upload is fast ~30s); sha256 in components.json
-      # lets the in-app updater skip unchanged downloads on the user's machine.
-      - name: Publish component archives and components.json
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ENGINE_SHA:  ${{ steps.sha.outputs.engine }}
-          PORTAL_SHA:  ${{ steps.sha.outputs.portal }}
-          PROC_SHA:    ${{ steps.sha.outputs.proc }}
-          NODE_VER:    ${{ steps.sha.outputs.node }}
-        run: |
-          VERSION="${TAG#v}"
-          REPO="${{ github.repository }}"
-          BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
-          ENTRIES='{}'
-
-          publish_component() {
-            local COMPONENT="$1" SRC="$2" GIT_SHA="$3"
-            local ARCHIVE="${COMPONENT}-${VERSION}.tar.gz"
-
-            if [ ! -d "$SRC" ]; then
-              echo "⚠ $COMPONENT: $SRC missing, skipping"
-              return
-            fi
-
-            tar czf "$ARCHIVE" -C "$(dirname "$SRC")" "$(basename "$SRC")"
-            SHA=$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')
-            gh release upload "${TAG}" "$ARCHIVE" --clobber -R "$REPO"
-
-            COMP_VERSION="$VERSION"
-            if [ -f "$SRC/component-version.json" ]; then
-              COMP_VERSION=$(jq -r --arg v "$VERSION" '.version // $v' "$SRC/component-version.json")
-            fi
-
-            ENTRIES=$(echo "$ENTRIES" | jq \
-              --arg k "$COMPONENT" --arg ver "$COMP_VERSION" \
-              --arg sha "$SHA" --arg url "$BASE_URL/$ARCHIVE" --arg git "$GIT_SHA" \
-              '.[$k] = {version:$ver, sha256:$sha, url:$url, gitSha:$git}')
-            echo "↑ $COMPONENT uploaded ($ARCHIVE, sha256=$SHA)"
-          }
-
-          publish_component "engine-server"     "dori-engine/desktop/src-tauri/engine-build"     "$ENGINE_SHA"
-          publish_component "portal-server"     "dori-engine/desktop/src-tauri/portal-build"     "$PORTAL_SHA"
-          publish_component "processing-server" "dori-engine/desktop/src-tauri/processing-build" "$PROC_SHA"
-          publish_component "node-runtime"      "dori-engine/desktop/src-tauri/node-runtime"     "$NODE_VER"
-
-          echo "$ENTRIES" | jq '.' > components.json
-          gh release upload "${TAG}" components.json --clobber -R "$REPO"
-          echo "Published components.json:"
-          cat components.json
-
-      # ── Rust build ────────────────────────────────────────────────────────────
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin, x86_64-apple-darwin
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
 
-      - name: Rust cache
+      - name: Restore Rust cache
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: dori-engine/desktop/src-tauri -> target
+          workspaces: dori/dori-engine/desktop/src-tauri -> target
 
-      # ── Release notes ─────────────────────────────────────────────────────────
-      - name: Extract release notes
-        id: notes
-        run: |
-          NOTES=$(awk "/^## ${TAG}/{found=1; next} found && /^## v/{exit} found{print}" \
-            dori-engine/docs/RELEASE_NOTES.md | sed '/^[[:space:]]*$/d' | head -20)
-          if [ -z "$NOTES" ]; then
-            NOTES="See https://github.com/vshrinath/dori-releases/releases/tag/${TAG} for details."
-          fi
-          echo "notes<<EOF" >> $GITHUB_OUTPUT
-          echo "$NOTES" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-      # ── Tauri build + publish DMG ─────────────────────────────────────────────
-      # Reset release body before tauri-action fetches it — multiline notes from a
-      # prior run cause "Bad control character in JSON" when tauri-action parses the
-      # GitHub API response.
-      - name: Reset release body
+      - name: Import Developer ID certificate
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
         run: |
-          gh release edit "${TAG}" --notes "See assets below to download and install." \
-            -R "${{ github.repository }}" 2>/dev/null || true
+          keychain="$RUNNER_TEMP/dori-release.keychain-db"
+          certificate="$RUNNER_TEMP/dori-release.p12"
+          keychain_password=$(openssl rand -hex 24)
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$certificate"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security list-keychains -d user -s "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain"
+          security find-identity -v -p codesigning "$keychain"
 
-      - name: Build & publish Tauri app
+      - name: Build signed capability manifest
+        run: |
+          inventory=dori/release/capabilities/inventory.json
+          licenses=dori/release/capabilities/LICENSES.md
+          test -f "$inventory"
+          test -s "$licenses"
+          node dori/dori-engine/desktop/scripts/build-capability-manifest.mjs "$inventory" "$DORI_CAPABILITY_MANIFEST_PATH"
+          node scripts/stage-capabilities.mjs "$inventory" "$DORI_CAPABILITY_MANIFEST_PATH" artifacts/capabilities "${{ github.repository }}" "$TAG"
+          node --test scripts/stage-capabilities.test.mjs
+          pnpm -C dori/dori-engine/desktop capabilities:test
+
+      - name: Build portal and sidecars
+        working-directory: dori
+        env:
+          DORI_APP_VERSION: ${{ inputs.tag }}
+          NEXT_TELEMETRY_DISABLED: 1
+        run: |
+          node -e "const v=require('./dori-engine/desktop/src-tauri/tauri.conf.json').version; if ('v'+v !== process.env.TAG) throw new Error('release tag does not match Tauri version')"
+          pnpm -C dori-portal build:tauri
+          node dori-engine/desktop/scripts/build-sidecars.mjs
+          pnpm -C dori-engine/desktop package:check
+
+      - name: Build signed universal app without publishing
         uses: tauri-apps/tauri-action@v0
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+          DORI_CAPABILITY_MANIFEST_PATH: ${{ env.DORI_CAPABILITY_MANIFEST_PATH }}
         with:
-          projectPath: dori-engine/desktop/src-tauri
-          tagName: ${{ env.TAG }}
-          releaseName: 'Dori ${{ env.TAG }}'
-          releaseBody: 'See assets below to download and install.'
-          releaseDraft: false
-          prerelease: ${{ contains(env.TAG, '-') }}
-          updaterJsonKeepUniversal: true
+          projectPath: dori/dori-engine/desktop/src-tauri
           args: --target universal-apple-darwin
 
-      # ── Sign + upload latest.json ─────────────────────────────────────────────
-      - name: Sign update bundle and upload latest.json
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+      - name: Validate notarization, Gatekeeper, and updater signature
         run: |
-          TAR_GZ=$(find dori-engine/desktop/src-tauri/target -name "*.app.tar.gz" 2>/dev/null | head -1)
-          if [ -z "$TAR_GZ" ]; then
-            echo "ERROR: no .app.tar.gz found under target/" && exit 1
-          fi
-          echo "Signing: $TAR_GZ"
-          npm install -g @tauri-apps/cli
-          tauri signer sign \
-            --private-key "$TAURI_SIGNING_PRIVATE_KEY" \
-            --password "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" \
-            "$TAR_GZ"
-          SIG=$(cat "${TAR_GZ}.sig")
-          VERSION="${TAG#v}"
-          PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/Dori_universal.app.tar.gz"
-          NOTES="${{ steps.notes.outputs.notes }}"
-          jq -n \
-            --arg version "$VERSION" \
-            --arg notes "$NOTES" \
-            --arg pub_date "$PUB_DATE" \
-            --arg sig "$SIG" \
-            --arg url "$URL" \
-            '{version:$version,notes:$notes,pub_date:$pub_date,platforms:{"darwin-universal":{signature:$sig,url:$url}}}' \
-            > latest.json
-          gh release upload "${TAG}" latest.json --clobber -R "${{ github.repository }}"
+          app=$(find dori/dori-engine/desktop/src-tauri/target -path '*/release/bundle/macos/Dori.app' -print -quit)
+          dmg=$(find dori/dori-engine/desktop/src-tauri/target -name '*.dmg' -print -quit)
+          updater=$(find dori/dori-engine/desktop/src-tauri/target -name '*.app.tar.gz' -print -quit)
+          test -n "$app" && test -n "$dmg" && test -n "$updater" && test -s "${updater}.sig"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          spctl --assess --type execute --verbose=4 "$app"
+          xcrun stapler validate "$dmg"
+          spctl --assess --type open --context context:primary-signature --verbose=4 "$dmg"
+          brew install minisign
+          printf '%s' "$(jq -r '.plugins.updater.pubkey' dori/dori-engine/desktop/src-tauri/tauri.conf.json)" | base64 --decode > "$RUNNER_TEMP/updater.pub"
+          minisign -Vm "$updater" -x "${updater}.sig" -p "$RUNNER_TEMP/updater.pub"
+          cp "$dmg" artifacts/
+          cp "$updater" "${updater}.sig" artifacts/
+          pnpm -C dori/dori-engine/desktop audit
 
-# ── Adding Windows later ──────────────────────────────────────────────────────
-# 1. Add `windows-latest` to the matrix.
-# 2. Guard darwin-arm64 Node URL and ONNX prune by platform in build-sidecars.mjs.
-# 3. Add Windows signing secrets if needed (TAURI_PRIVATE_KEY is cross-platform).
-# The portal /api/update route already returns platforms['windows-x86_64'].
+      - name: Create updater manifest last
+        run: |
+          updater=$(find artifacts -maxdepth 1 -name '*.app.tar.gz' -print -quit)
+          updater_name=$(basename "$updater")
+          version="${TAG#v}"
+          url="https://github.com/${{ github.repository }}/releases/download/${TAG}/${updater_name}"
+          jq -n \
+            --arg version "$version" \
+            --arg notes "Dori $TAG" \
+            --arg pub_date "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            --rawfile signature "${updater}.sig" \
+            --arg url "$url" \
+            '{version:$version,notes:$notes,pub_date:$pub_date,platforms:{"darwin-universal":{signature:$signature,url:$url}}}' \
+            > artifacts/latest.json
+
+      - name: Retain validated dry-run artifacts
+        if: ${{ inputs.dry_run }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: dori-${{ inputs.tag }}-validated
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Create hidden draft and upload complete asset set
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" --repo "${{ github.repository }}" --draft --title "Dori $TAG" --notes "Validated Dori release."
+          while IFS= read -r -d '' asset; do
+            gh release upload "$TAG" "$asset" --repo "${{ github.repository }}"
+          done < <(find artifacts -maxdepth 2 -type f -print0)
+
+      - name: Verify draft assets and publish atomically
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          find artifacts -maxdepth 2 -type f -exec basename {} \; | sort > "$RUNNER_TEMP/expected-assets"
+          gh api "repos/${{ github.repository }}/releases/tags/${TAG}" --jq '.assets[].name' | sort > "$RUNNER_TEMP/remote-assets"
+          diff -u "$RUNNER_TEMP/expected-assets" "$RUNNER_TEMP/remote-assets"
+          gh release edit "$TAG" --repo "${{ github.repository }}" --draft=false ${{ contains(inputs.tag, '-') && '--prerelease' || '--latest' }}
